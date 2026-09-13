@@ -1,0 +1,13 @@
+# Templated cups-files.conf — rendered by entrypoint.sh via envsubst
+
+LogFilePerm 0640
+FileDevice No
+FatalErrors config
+
+User root
+Group lp
+SystemGroup lpadmin
+
+AccessLog /var/log/cups/access_log
+ErrorLog /var/log/cups/error_log
+PageLog /var/log/cups/page_log
