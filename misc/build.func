@@ -1,126 +1,101 @@
 #!/usr/bin/env bash
-# misc/build.func
-#
-# Shared helpers for creating and provisioning the cups-print-server LXC.
-# Sourced by ct/cups-print-server.sh — not meant to be run directly.
+# Shared Proxmox provisioning helpers; sourced by ct/cups-print-server.sh.
+die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+check_root() { [[ "$(id -u)" == 0 ]] || die 'Run as root.'; }
+check_pve() {
+  command -v pveversion >/dev/null || die 'Run this entrypoint on a Proxmox VE host.'
+}
 
-# ---- output helpers -------------------------------------------------
-CL_RESET="\033[0m"; CL_GREEN="\033[1;32m"; CL_YELLOW="\033[1;33m"; CL_RED="\033[1;31m"; CL_CYAN="\033[1;36m"
-
-msg_info()  { echo -e " ${CL_CYAN}➜${CL_RESET} $1"; }
-msg_ok()    { echo -e " ${CL_GREEN}✔${CL_RESET} $1"; }
-msg_warn()  { echo -e " ${CL_YELLOW}⚠${CL_RESET} $1"; }
-msg_error() { echo -e " ${CL_RED}✘${CL_RESET} $1" >&2; }
-
-die() { msg_error "$1"; exit 1; }
-
-# ---- environment checks ----------------------------------------------
-check_root() {
-  if [[ "$(id -u)" -ne 0 ]]; then
-    die "This script must be run as root on the Proxmox VE host."
+select_storage() {
+  local content="$1" preferred="$2" available
+  available="$(pvesm status --content "$content" | awk 'NR > 1 && $3 == "active" {print $1}')"
+  [[ -n "$available" ]] || die "No active storage supports $content. Configure storage in Proxmox first."
+  if grep -qxF "$preferred" <<< "$available"; then
+    printf '%s\n' "$preferred"
+  else
+    # ponytail: choose the first capable pool; set STORAGE for multi-pool placement.
+    printf '%s\n' "${available%%$'\n'*}"
   fi
 }
 
-check_pve() {
-  command -v pveversion >/dev/null 2>&1 || die "pveversion not found — this script must run on a Proxmox VE host."
-}
-
-next_free_ctid() {
-  pvesh get /cluster/nextid 2>/dev/null || echo 900
-}
-
-# ---- default, overridable settings -----------------------------------
 set_defaults() {
-  CTID="${CTID:-$(next_free_ctid)}"
-  HOSTNAME="${HOSTNAME:-cups-print-server}"
+  CTID="${CTID:-$(pvesh get /cluster/nextid)}"
+  # Bash already sets HOSTNAME to the host's name; never use it as a default.
+  CT_HOSTNAME="${CT_HOSTNAME:-cups-print-server}"
   DISK_SIZE_GB="${DISK_SIZE_GB:-4}"
   MEMORY_MB="${MEMORY_MB:-768}"
   SWAP_MB="${SWAP_MB:-512}"
   CORES="${CORES:-1}"
-  BRIDGE="${BRIDGE:-vmbr0}"
+  if [[ -z "${BRIDGE:-}" ]]; then
+    BRIDGE="$(ip -o link show type bridge | awk -F': ' '{print $2}' | cut -d@ -f1 | sort | sed -n '1p')"
+    [[ ! -d /sys/class/net/vmbr0/bridge ]] || BRIDGE=vmbr0
+  fi
+  [[ -n "$BRIDGE" || -n "${NET_CONFIG:-}" ]] || die 'No bridge found; set BRIDGE or NET_CONFIG.'
   NET_CONFIG="${NET_CONFIG:-name=eth0,bridge=${BRIDGE},ip=dhcp}"
-  STORAGE="${STORAGE:-local-lvm}"
-  TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
-  OS_TEMPLATE="${OS_TEMPLATE:-}"          # auto-detected if empty
+  STORAGE="${STORAGE:-$(select_storage rootdir local-lvm)}"
+  TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-$(select_storage vztmpl local)}"
+  OS_TEMPLATE="${OS_TEMPLATE:-}"
   UNPRIVILEGED="${UNPRIVILEGED:-1}"
   ENABLE_USB_PASSTHROUGH="${ENABLE_USB_PASSTHROUGH:-no}"
-  INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/ahnaj/cups-gutenprint-argyllcms-proxmox-LXC-print-server/main/install/cups-print-server-install.sh}"
+  CUPS_USER="${CUPS_USER:-cupsadmin}"
+  # A bounded read avoids tr|head SIGPIPE under pipefail.
+  CUPS_PASSWORD="${CUPS_PASSWORD:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}"
 }
 
-# ---- template handling -------------------------------------------------
-ensure_template() {
-  if [[ -n "$OS_TEMPLATE" ]]; then
-    return
-  fi
-  msg_info "Looking for a Debian 12 container template..."
-  local found
-  found=$(pveam list "${TEMPLATE_STORAGE}" 2>/dev/null | awk '/debian-12-standard/ {print $1}' | tail -n1)
-  if [[ -z "$found" ]]; then
-    msg_info "Template not found locally, downloading debian-12-standard..."
-    pveam update >/dev/null
-    local remote
-    remote=$(pveam available --section system | awk '/debian-12-standard/ {print $2}' | tail -n1)
-    [[ -n "$remote" ]] || die "Could not find a debian-12-standard template to download."
-    pveam download "${TEMPLATE_STORAGE}" "$remote"
-    found=$(pveam list "${TEMPLATE_STORAGE}" 2>/dev/null | awk '/debian-12-standard/ {print $1}' | tail -n1)
-  fi
-  OS_TEMPLATE="$found"
-  msg_ok "Using template: ${OS_TEMPLATE}"
-}
-
-# ---- container lifecycle ----------------------------------------------
-create_container() {
-  msg_info "Creating LXC ${CTID} (${HOSTNAME})..."
-  pct create "${CTID}" "${OS_TEMPLATE}" \
-    --hostname "${HOSTNAME}" \
-    --storage "${STORAGE}" \
-    --rootfs "${STORAGE}:${DISK_SIZE_GB}" \
-    --memory "${MEMORY_MB}" \
-    --swap "${SWAP_MB}" \
-    --cores "${CORES}" \
-    --net0 "${NET_CONFIG}" \
-    --unprivileged "${UNPRIVILEGED}" \
-    --features nesting=1 \
-    --onboot 1 \
-    >/dev/null
-  msg_ok "Container ${CTID} created."
-
-  if [[ "${ENABLE_USB_PASSTHROUGH}" == "yes" ]]; then
-    msg_info "Enabling USB passthrough for CTID ${CTID}..."
-    {
-      echo "lxc.cgroup2.devices.allow: c 189:* rwm"
-      echo "lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir"
-    } >> "/etc/pve/lxc/${CTID}.conf"
-    msg_ok "USB passthrough enabled (raw USB bus mounted into the container)."
-  fi
-
-  msg_info "Starting container..."
-  pct start "${CTID}"
-  # wait for networking to come up
-  for _ in $(seq 1 30); do
-    if pct exec "${CTID}" -- getent hosts deb.debian.org >/dev/null 2>&1; then
-      break
-    fi
-    sleep 1
+validate_settings() {
+  local name
+  [[ "$CTID" =~ ^[1-9][0-9]{2,8}$ ]] || die 'CTID must be a Proxmox guest ID (100 or greater).'
+  [[ "$CT_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || die 'CT_HOSTNAME must be a valid hostname label.'
+  [[ "$CUPS_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$CUPS_USER" != root ]] || die 'Choose a non-root Linux account name for CUPS_USER.'
+  [[ "$CUPS_PASSWORD" != *$'\n'* && "$CUPS_PASSWORD" != *$'\r'* ]] || die 'CUPS_PASSWORD must be a single line.'
+  for name in DISK_SIZE_GB MEMORY_MB CORES; do
+    [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer."
   done
-  msg_ok "Container ${CTID} is running."
+  [[ "$SWAP_MB" =~ ^[0-9]+$ ]] || die 'SWAP_MB must be a non-negative integer.'
+  [[ "$UNPRIVILEGED" =~ ^[01]$ ]] || die 'UNPRIVILEGED must be 0 or 1.'
+  [[ "$ENABLE_USB_PASSTHROUGH" == no || "$ENABLE_USB_PASSTHROUGH" == yes ]] || die 'ENABLE_USB_PASSTHROUGH must be yes or no.'
+  # pct create is the final authority for cluster-wide ID collisions.
+  [[ ! -e "/etc/pve/lxc/$CTID.conf" && ! -e "/etc/pve/qemu-server/$CTID.conf" ]] || die "Guest $CTID already exists. Choose another ID."
 }
 
-run_install_script() {
-  msg_info "Fetching and running the install script inside CTID ${CTID}..."
-  pct exec "${CTID}" -- bash -c "apt-get update -qq && apt-get install -y -qq curl >/dev/null"
-  pct push "${CTID}" "${LOCAL_INSTALL_SCRIPT}" /root/cups-print-server-install.sh
-  pct exec "${CTID}" -- bash /root/cups-print-server-install.sh
-  msg_ok "Install script finished."
+ensure_template() {
+  [[ -z "$OS_TEMPLATE" ]] || return 0
+  local remote
+  OS_TEMPLATE="$(pveam list "$TEMPLATE_STORAGE" | awk '/debian-12-standard/ {print $1}' | sort -V | tail -n1)"
+  if [[ -z "$OS_TEMPLATE" ]]; then
+    pveam update
+    remote="$(pveam available --section system | awk '/debian-12-standard/ {print $2}' | sort -V | tail -n1)"
+    [[ -n "$remote" ]] || die 'No Debian 12 template available. Set OS_TEMPLATE to a Debian 12/13 volume ID.'
+    pveam download "$TEMPLATE_STORAGE" "$remote"
+    OS_TEMPLATE="$TEMPLATE_STORAGE:vztmpl/$remote"
+  fi
+}
+
+create_container() {
+  pct create "$CTID" "$OS_TEMPLATE" --hostname "$CT_HOSTNAME" \
+    --rootfs "$STORAGE:$DISK_SIZE_GB" --memory "$MEMORY_MB" --swap "$SWAP_MB" \
+    --cores "$CORES" --net0 "$NET_CONFIG" --unprivileged "$UNPRIVILEGED" --onboot 1
+  if [[ "$ENABLE_USB_PASSTHROUGH" == yes ]]; then
+    printf '%s\n' 'lxc.cgroup2.devices.allow: c 189:* rwm' \
+      'lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir' >> "/etc/pve/lxc/$CTID.conf"
+    printf 'USB bus mounted; unprivileged USB access also requires host device permissions. See README.\n'
+  fi
+  pct start "$CTID"
+  local attempt
+  for ((attempt=0; attempt<60; attempt++)); do
+    if pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  die "CT $CTID did not acquire working DNS within 120 seconds. Check its bridge, DHCP, gateway and DNS."
 }
 
 print_summary() {
   local ip
-  ip=$(pct exec "${CTID}" -- hostname -I 2>/dev/null | awk '{print $1}')
-  echo
-  msg_ok "cups-print-server is up in CTID ${CTID}."
-  echo -e "   ${CL_CYAN}Web UI:${CL_RESET} https://${ip}:631"
-  echo -e "   ${CL_CYAN}Admin user:${CL_RESET} ${CUPS_USER}"
-  echo
-  msg_warn "Log into the container (pct enter ${CTID}) to add printers, or use lpadmin/system-config-printer."
+  ip="$(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
+  [[ -n "$ip" ]] || die "CT $CTID has no address."
+  [[ "$ip" != *:* ]] || ip="[$ip]"
+  printf '\nCUPS ready in CT %s\nWeb UI: https://%s:631\nAdmin: %s\nPassword: %s\n' "$CTID" "$ip" "$CUPS_USER" "$CUPS_PASSWORD"
+  printf 'Save the password. Add your printer in Administration or run: pct enter %s\n' "$CTID"
 }

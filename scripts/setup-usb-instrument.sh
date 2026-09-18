@@ -54,13 +54,18 @@ case "${1:-}" in
     ;;
 
   grant)
+    [[ "$(id -u)" == 0 ]] || { echo 'Run as root on the Proxmox host.' >&2; exit 1; }
     VIDPID="${2:?usage: $0 grant <vendor:product> [ctid]}"
     CTID="${3:-}"
     VID="${VIDPID%%:*}"
     PID="${VIDPID##*:}"
 
-    [[ "$VID" =~ ^[0-9a-fA-F]{4}$ && "$PID" =~ ^[0-9a-fA-F]{4}$ ]] \
+    [[ "$VIDPID" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
       || { echo "Expected format vendor:product, e.g. 0765:5020" >&2; exit 1; }
+    if [[ -n "$CTID" ]]; then
+      [[ "$CTID" =~ ^[1-9][0-9]{2,8}$ && -f "/etc/pve/lxc/$CTID.conf" ]] \
+        || { echo 'CTID must name an existing container.' >&2; exit 1; }
+    fi
 
     echo "==> Confirming device is currently visible on the host..."
     if ! lsusb -d "${VID}:${PID}" >/dev/null 2>&1; then

@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-#
-# ct/update.sh
-#
-# Updates CUPS/Gutenprint packages inside an existing cups-print-server LXC.
-# Run on the Proxmox host:
-#
-#   CTID=150 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ahnaj/cups-gutenprint-argyllcms-proxmox-LXC-print-server/main/ct/update.sh)"
-
+# Run on the Proxmox host with CTID=<existing container>.
 set -euo pipefail
-
-: "${CTID:?Set CTID to the container ID to update, e.g. CTID=150}"
-
-echo "==> Updating packages in CTID ${CTID}..."
-pct exec "${CTID}" -- bash -c "
+: "${CTID:?Set CTID to the container ID to update}"
+[[ "$CTID" =~ ^[1-9][0-9]{2,8}$ ]] || { echo 'Invalid CTID' >&2; exit 1; }
+[[ "$(id -u)" == 0 ]] && command -v pct >/dev/null || { echo 'Run as root on Proxmox VE' >&2; exit 1; }
+pct exec "$CTID" -- bash -euo pipefail -c '
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get upgrade -y -qq cups cups-filters printer-driver-gutenprint printer-driver-all avahi-daemon
-  systemctl restart cups
-"
-echo "==> Done."
+  apt-get update
+  apt-get install --only-upgrade -y cups cups-bsd cups-client cups-filters \
+    printer-driver-gutenprint printer-driver-all avahi-daemon avahi-utils \
+    libnss-mdns usbutils argyll colord
+  cupsd -t
+  systemctl restart cups avahi-daemon
+  systemctl is-active --quiet cups avahi-daemon
+  lpstat -r
+'
+printf 'CT %s packages updated; queues, configuration and passwords retained.\n' "$CTID"

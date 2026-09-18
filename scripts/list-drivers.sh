@@ -9,17 +9,19 @@
 
 set -euo pipefail
 
-CONTAINER="${CONTAINER:-cups-print-server}"
-
 case "${1:-}" in
   --devices)
-    docker exec "${CONTAINER}" lpinfo -v
+    lpinfo -v
     ;;
   --search)
-    query="${2:-}"
-    docker exec "${CONTAINER}" lpinfo -m | grep -i "gutenprint" | grep -i "${query}"
+    query="${2:?Supply a search term}"
+    lpinfo -m | grep -i "gutenprint" | grep -iF -- "${query}"
+    ;;
+  '')
+    lpinfo -m | grep -i "gutenprint"
     ;;
   *)
-    docker exec "${CONTAINER}" lpinfo -m | grep -i "gutenprint"
+    echo "Usage: $0 [--devices | --search text]" >&2
+    exit 1
     ;;
 esac
